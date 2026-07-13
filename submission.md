@@ -1,5 +1,14 @@
 # submission.md
 
+## AI Usage
+
+I used Claude throughout this project for codebase orientation and debugging support, not for blind code generation.
+
+- **Orientation:** Pasted `models.py`, `routes/songs.py`, `routes/playlists.py`, `notification_service.py`, and `playlist_service.py` and asked for a walkthrough of what each did and how the two README call chains worked. This helped me quickly see that `rate_song()` in `notification_service.py` never called `create_notification()`, unlike `add_to_playlist()` in the same file.
+- **Reproduction:** Asked for exact `flask shell` and `curl` commands to reproduce each bug before touching any code. When my first playlist-creation attempt hit an unrelated 500 error (a real `position` NOT NULL bug in `add_to_playlist()`), I asked for help diagnosing the traceback rather than guessing, and worked around it by using an existing seeded playlist instead.
+- **Debugging streak logic:** Asked about the difference between Python's `weekday()` and `isoweekday()` once I'd already narrowed the bug to a date comparison, which confirmed `weekday()` returns 6 for Sunday.
+- **Verification:** For each fix, I re-ran the same reproduction steps myself and confirmed the real output (streak value, notification list, playlist song count) before writing the RCA entry — I didn't rely on predicted behavior alone.
+
 ## Codebase Map
 
 ### Main files and their roles
@@ -48,30 +57,38 @@ return [song.to_dict() for song in songs[:-1]]
 
 ### Issue #1: My listening streak keeps resetting
 
-**How I reproduced it:** Set a user's `last_listened_at` to a Saturday with `listening_streak = 12`, then called `record_listening_event` with `now` set to the following Sunday (one day later). The streak reset to 1 instead of incrementing to 13.
+**How I reproduced it:** In `flask shell`, set a seeded user's `listening_streak` to 12 and `last_listened_at` to a simulated Saturday, then called `update_listening_streak()` with a simulated Sunday (one day later, confirmed via `sunday.weekday() == 6` printing `True`). The streak dropped to 1 instead of incrementing to 13.
 
-**How I found the root cause:** Traced `POST /songs/<id>/listen` in `routes/songs.py` to `record_listening_event()` in `streak_service.py`, which calls `update_listening_streak()`. Read the conditional logic line by line and checked what `datetime.weekday()` actually returns.
+**How I found the root cause:** Traced `POST /songs/<id>/listen` in `routes/songs.py` to `record_listening_event()` in `streak_service.py`, which calls `update_listening_streak()`. Read the conditional logic line by line and checked what `datetime.weekday()` actually returns for each day.
 
 **The root cause:** The condition `days_since_last == 1 and today.weekday() != 6` was meant to detect a valid consecutive day, but `weekday()` returns 6 for Sunday in Python. So on any Sunday, even with exactly one day since the last listen, the second condition evaluates to `False`, and the code falls through to the `else` branch, resetting the streak to 1 instead of incrementing it.
 
-**My fix and side-effect check:** Removed the `today.weekday() != 6` condition entirely, leaving `elif days_since_last == 1:` as the only check needed to detect a consecutive day. Verified the fix by re-running the reproduction case (Saturday → Sunday) and confirming the streak now increments correctly, and also checked Monday→Tuesday and same-day cases still behave as before.
+**My fix and side-effect check:** Removed the `today.weekday() != 6` condition entirely, leaving `elif days_since_last == 1:` as the only check needed to detect a consecutive day. Verified by rerunning the exact reproduction case — streak now increments as expected across the Sunday boundary. Also confirmed same-day listens still result in no change, and skipped-day cases still reset the streak to 1.
 
 ### Issue #4: I got notified when a friend added my song to a playlist but not when they rated it
 
-**How I reproduced it:** Added a song to a playlist as a different user than the sharer and confirmed a notification appeared. Then rated a different shared song as a different user and checked the sharer's notifications, nothing new appeared.
+**How I reproduced it:** Confirmed a user's notifications were empty (`count: 0`), then rated one of their shared songs as a different user via `POST /songs/<id>/rate`. The rating saved successfully (201, rating object returned), but checking notifications again still showed `count: 0`.
 
-**How I found the root cause:** Traced `POST /songs/<id>/rate` to `rate_song()` in `notification_service.py`. Compared it line-by-line against `add_to_playlist()` in the same file, which follows a "do the action, then call `create_notification()`" pattern.
+**How I found the root cause:** Traced `POST /songs/<id>/rate` to `rate_song()` in `notification_service.py`. Compared it line-by-line against `add_to_playlist()` in the same file, which follows a "do the action, commit, then call `create_notification()`" pattern.
 
-**The root cause:** `rate_song()` saves or updates the `Rating` row and commits, but never calls `create_notification()` afterward. Unlike `add_to_playlist()`, which explicitly notifies the song's sharer after its main action, `rate_song()` has no equivalent step, the notification-creation call was simply never added.
+**The root cause:** `rate_song()` saves or updates the `Rating` row and commits, but never calls `create_notification()` afterward. Unlike `add_to_playlist()`, which explicitly notifies the song's sharer after its main action, `rate_song()` has no equivalent step — the notification-creation call was simply never added.
 
-**My fix and side-effect check:** Added a call to `create_notification()` at the end of `rate_song()`, guarded so the sharer isn't notified about their own rating (matching the same guard used in `add_to_playlist()`). Verified by re-rating a song and confirming a notification now appears, and confirmed rating your own song still creates no notification.
+**My fix and side-effect check:** Added a call to `create_notification()` at the end of `rate_song()`, guarded so the sharer isn't notified about their own rating (matching the same guard used in `add_to_playlist()`). Verified by re-rating the song and confirming a `song_rated` notification appeared with the correct body text ("darius rated your song 'Crown Heights Anthem' 3 stars."). Also confirmed the existing playlist-add notification flow still works unaffected, since it's a separate function.
 
 ### Issue #5: The last song in a playlist never shows up
 
-**How I reproduced it:** Fetched a playlist's songs, counted them, added one more song, and re-fetched, the newly added song was missing and the count still matched what was there before.
+**How I reproduced it:** Queried an existing seeded playlist ("Friday Energy") directly in the database and confirmed it had 7 entries in `playlist_entries`, but `GET /playlists/<id>/songs` returned `"count": 6`, missing the most recently added song.
 
-**How I found the root cause:** Traced `GET /playlists/<id>/songs` to `get_playlist_songs()` in `playlist_service.py`. The query itself correctly joins and orders songs by `position` ascending, but the return statement slices the list.
+**How I found the root cause:** Traced `GET /playlists/<id>/songs` to `get_playlist_songs()` in `playlist_service.py`. The query correctly joins and orders songs by `position` ascending, but the return statement slices the list.
 
-**The root cause:** `return [song.to_dict() for song in songs[:-1]]` drops the last element of the correctly-ordered list before converting to dicts. Since songs are ordered ascending by `position`, the last element is always the most recently added song, so it's silently excluded from every response.
+**The root cause:** `return [song.to_dict() for song in songs[:-1]]` drops the last element of the correctly-ordered list before converting to dicts. Since songs are ordered ascending by `position`, the last element is always the most recently added song, so it's silently excluded from every response. The function's own docstring even claims it "returns all songs in the playlist," directly contradicted by the slice.
 
-**My fix and side-effect check:** Changed `songs[:-1]` to `songs` so the full ordered list is returned. Verified by re-fetching a playlist after adding a new song and confirming all songs now appear, including the newest, and confirmed ordering is still correct.
+**My fix and side-effect check:** Changed `songs[:-1]` to `songs` so the full ordered list is returned. Verified by re-fetching the same playlist and confirming `"count": 7`, with the previously-missing song ("Harlem Renaissance") now present and ordering still correct.
+
+### Note on an additional bug found but not fixed
+
+While reproducing Issue #5, attempting to add a song to a brand-new playlist via `POST /playlists/<id>/songs` triggered a 500 error: `sqlite3.IntegrityError: NOT NULL constraint failed: playlist_entries.position`. This is because `add_to_playlist()` in `notification_service.py` uses `playlist.songs.append(song)`, a SQLAlchemy relationship shortcut that only auto-fills `playlist_id`, `song_id`, and `added_at` — it never sets `position` or `added_by`, both of which are NOT NULL columns. This is a real, separate bug from the 5 assigned issues. It wasn't fixed as part of this project since it's outside the three issues chosen, but it's worth flagging since it blocks adding songs to any playlist with zero existing entries.
+
+## Screenshot
+
+![git log output](screenshots\gitlog_sc.png)
